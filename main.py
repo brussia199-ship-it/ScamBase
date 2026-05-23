@@ -1,710 +1,465 @@
 import asyncio
-import sqlite3
+import random
+import json
 import os
-from datetime import datetime
-from typing import Optional, Tuple
+from datetime import datetime, date, timedelta
+from collections import defaultdict
 
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters import Command, CommandObject
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.enums import ParseMode
+from aiogram.utils.markdown import hbold, hcode
+from aiogram.types.input_file import FSInputFile
 
-# ================= КОНФИГУРАЦИЯ =================
-BOT_TOKEN = "8655931539:AAE9DjvBYScMBrutC17TP0UaLBc_jj_bo2U"  # Замените на ваш токен от @BotFather
-ADMIN_IDS = [7673683792]  # ID администраторов (укажите свои)
-STAR_PRICE = 500  # Стоимость удаления в звёздах Telegram
+# ========== КОНФИГУРАЦИЯ ==========
+BOT_TOKEN = "8854156297:AAH_Gr1faNeHDznR4D9KzjzupWsqY64-6IA"  # Замени на свой токен!
+ADMIN_IDS = [7673683792]  # Сюда вставь свой Telegram ID (целое число)
 
-# ================= СОСТОЯНИЯ FSM =================
-class ReportStates(StatesGroup):
-    waiting_for_username = State()  # Ожидание username для подачи заявки
-    waiting_for_proof_photos = State()  # Ожидание доказательств (фото)
-    waiting_for_proof_videos = State()  # Ожидание доказательств (видео)
+# Файл для хранения данных пользователей
+DATA_FILE = "user_data.json"
 
-class AdminAddStates(StatesGroup):
-    waiting_for_username = State()  # Ожидание username для добавления
-    waiting_for_label = State()  # Ожидание метки
+# ========== ЗАГРУЗКА/СОХРАНЕНИЕ ДАННЫХ ==========
+def load_data():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
 
-class AdminRemoveStates(StatesGroup):
-    waiting_for_username = State()  # Ожидание username для удаления
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-# ================= ИНИЦИАЛИЗАЦИЯ =================
+# Структура данных:
+# {
+#   "user_id": {
+#       "balance": 1000,
+#       "last_daily": "2025-01-01",
+#       "wins": 0,
+#       "losses": 0
+#   }
+# }
+
+# Кэш в памяти для быстрого доступа
+user_cache = load_data()
+
+def get_user(user_id):
+    uid = str(user_id)
+    if uid not in user_cache:
+        user_cache[uid] = {
+            "balance": 1000,
+            "last_daily": None,
+            "wins": 0,
+            "losses": 0
+        }
+    return user_cache[uid]
+
+def save_user(user_id):
+    save_data(user_cache)
+
+# ========== АНИМИРОВАННЫЕ КУБИКИ (TG анимация через dice) ==========
+async def roll_dice(message: Message, bet: int, choice: str = None):
+    """Бросает кубик в Telegram с анимацией и возвращает результат"""
+    dice_msg = await message.answer_dice(emoji="🎲")
+    value = dice_msg.dice.value
+    return value
+
+# Дуэль кубиков: два броска
+async def dice_duel(message: Message, bet: int, player1_id: int, player2_id: int):
+    """Анимированная дуэль кубиков. Возвращает (winner_id, value1, value2)"""
+    # Первый игрок бросает
+    msg1 = await message.answer_dice(emoji="🎲")
+    val1 = msg1.dice.value
+    await asyncio.sleep(1)  # небольшая пауза для драматичности
+    
+    # Второй игрок бросает
+    msg2 = await message.answer_dice(emoji="🎲")
+    val2 = msg2.dice.value
+    
+    if val1 > val2:
+        return player1_id, val1, val2
+    elif val2 > val1:
+        return player2_id, val1, val2
+    else:
+        return None, val1, val2  # Ничья
+
+# ========== ОСНОВНЫЕ КОМАНДЫ ==========
 bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+dp = Dispatcher()
 
-
-# ================= РАБОТА С БАЗОЙ ДАННЫХ =================
-def init_db():
-    """Инициализация базы данных"""
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    
-    # Таблица пользователей в ScamBase
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS scambase (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            label TEXT DEFAULT 'Scammer',
-            added_by INTEGER,
-            added_date TEXT,
-            proof_photos TEXT DEFAULT '',
-            proof_videos TEXT DEFAULT ''
-        )
-    ''')
-    
-    # Таблица заявок от пользователей
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            reported_by INTEGER,
-            proof_photos TEXT,
-            proof_videos TEXT,
-            status TEXT DEFAULT 'pending',
-            report_date TEXT
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-
-
-def is_in_scambase(username: str) -> bool:
-    """Проверка, есть ли человек в ScamBase"""
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    cur.execute('SELECT label FROM scambase WHERE username = ?', (username,))
-    result = cur.fetchone()
-    conn.close()
-    return result[0] if result else None
-
-
-def add_to_scambase(username: str, label: str, admin_id: int, proof_photos: str = '', proof_videos: str = '') -> bool:
-    """Добавление человека в базу (только админ)"""
-    try:
-        conn = sqlite3.connect('scambase.db')
-        cur = conn.cursor()
-        cur.execute('''
-            INSERT INTO scambase (username, label, added_by, added_date, proof_photos, proof_videos)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (username, label, admin_id, datetime.now().isoformat(), proof_photos, proof_videos))
-        conn.commit()
-        conn.close()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-
-
-def remove_from_scambase(username: str) -> bool:
-    """Удаление человека из базы"""
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    cur.execute('DELETE FROM scambase WHERE username = ?', (username,))
-    deleted = cur.rowcount > 0
-    conn.commit()
-    conn.close()
-    return deleted
-
-
-def update_label(username: str, new_label: str) -> bool:
-    """Обновление метки пользователя"""
-    if new_label not in ['Scammer', 'Face', 'Worker']:
-        return False
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    cur.execute('UPDATE scambase SET label = ? WHERE username = ?', (new_label, username))
-    updated = cur.rowcount > 0
-    conn.commit()
-    conn.close()
-    return updated
-
-
-def add_report(username: str, user_id: int, photos: list, videos: list) -> bool:
-    """Добавление заявки на человека"""
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    cur.execute('''
-        INSERT INTO reports (username, reported_by, proof_photos, proof_videos, status, report_date)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (username, user_id, ','.join(photos), ','.join(videos), 'pending', datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-    return True
-
-
-def get_pending_reports() -> list:
-    """Получение всех ожидающих заявок"""
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    cur.execute('SELECT id, username, reported_by, proof_photos, proof_videos, report_date FROM reports WHERE status = "pending"')
-    results = cur.fetchall()
-    conn.close()
-    return results
-
-
-def approve_report(report_id: int, username: str, label: str, admin_id: int):
-    """Одобрение заявки и добавление в базу"""
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    
-    # Обновляем статус заявки
-    cur.execute('UPDATE reports SET status = "approved" WHERE id = ?', (report_id,))
-    
-    # Добавляем в основную базу
-    cur.execute('''
-        INSERT OR IGNORE INTO scambase (username, label, added_by, added_date)
-        VALUES (?, ?, ?, ?)
-    ''', (username, label, admin_id, datetime.now().isoformat()))
-    
-    conn.commit()
-    conn.close()
-
-
-def reject_report(report_id: int):
-    """Отклонение заявки"""
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    cur.execute('UPDATE reports SET status = "rejected" WHERE id = ?', (report_id,))
-    conn.commit()
-    conn.close()
-
-
-# ================= КЛАВИАТУРЫ =================
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Главное меню"""
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔍 Поиск в ScamBase", callback_data="search")
-    builder.button(text="⭐ Удалить себя (500 ⭐)", callback_data="delete_self")
-    builder.button(text="📝 Подать заявку на скаммера", callback_data="report")
-    builder.button(text="📊 Статистика", callback_data="stats")
-    
-    if True:  # Проверка на админа будет в хендлере
-        builder.button(text="👑 Админ-панель", callback_data="admin_panel")
-    
-    builder.adjust(1)
-    return builder.as_markup()
-
-
-def admin_panel_keyboard() -> InlineKeyboardMarkup:
-    """Панель администратора"""
-    builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Добавить в базу", callback_data="admin_add")
-    builder.button(text="❌ Удалить из базы", callback_data="admin_remove")
-    builder.button(text="🏷️ Выдать метку", callback_data="admin_label")
-    builder.button(text="📋 Заявки от пользователей", callback_data="admin_reports")
-    builder.button(text="🔙 Назад", callback_data="back_to_menu")
-    builder.adjust(1)
-    return builder.as_markup()
-
-
-def label_keyboard(username: str) -> InlineKeyboardMarkup:
-    """Клавиатура выбора метки"""
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔴 Scammer", callback_data=f"label_{username}_Scammer")
-    builder.button(text="🟡 Face", callback_data=f"label_{username}_Face")
-    builder.button(text="🟢 Worker", callback_data=f"label_{username}_Worker")
-    builder.button(text="🔙 Отмена", callback_data="admin_panel")
-    builder.adjust(1)
-    return builder.as_markup()
-
-
-# ================= ОБЩИЕ ХЕНДЛЕРЫ =================
+# Команда /start
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    """Обработчик команды /start"""
+    user_id = message.from_user.id
+    get_user(user_id)
+    save_user(user_id)
+    
     await message.answer(
-        "👋 Добро пожаловать в ScamBase Bot!\n\n"
-        "🔍 Я помогу проверить, есть ли человек в базе скамеров.\n"
-        "📝 Также ты можешь подать заявку на добавление скамера с доказательствами.\n\n"
-        "Используй кнопки ниже для навигации:",
-        reply_markup=main_menu_keyboard()
+        f"🎰 Привет, {message.from_user.first_name}!\n\n"
+        f"Добро пожаловать в Casino Bot!\n"
+        f"Твой баланс: {get_user(user_id)['balance']} монет\n\n"
+        f"🎲 Команды для беседы:\n"
+        f"/dice_battle [сумма] - создать дуэль на кубиках\n"
+        f"/evenodd [сумма] [чёт/нечёт] - игра чёт/нечёт\n"
+        f"/football [сумма] - игра в футбол (анимация)\n"
+        f"/daily - ежедневный бонус +500\n"
+        f"/balance - показать баланс\n\n"
+        f"👑 Админ-команды:\n"
+        f"/chat_info - инфо о беседе\n"
+        f"/give [user_id] [сумма] - выдать валюту\n"
+        f"/ping - пинг бота\n"
+        f"/stats - статистика бота\n"
+        f"/user_stats [user_id] - статистика игрока"
     )
 
-
-@dp.callback_query(F.data == "search")
-async def search_prompt(callback: CallbackQuery, state: FSMContext):
-    """Запрос username для поиска"""
-    await callback.message.answer("🔍 Введите username человека для проверки (без @):")
-    await callback.answer()
-    await state.set_state("waiting_for_search")
-
-
-@dp.message(StateFilter("waiting_for_search"))
-async def perform_search(message: Message, state: FSMContext):
-    """Выполнение поиска"""
-    username = message.text.strip().replace('@', '')
-    label = is_in_scambase(username)
+# Ежедневный бонус
+@dp.message(Command("daily"))
+async def daily_bonus(message: Message):
+    user_id = message.from_user.id
+    user = get_user(user_id)
     
-    if label:
-        await message.answer(
-            f"⚠️ <b>РЕЗУЛЬТАТ ПОИСКА</b> ⚠️\n\n"
-            f"👤 Username: @{username}\n"
-            f"🏷️ Метка: {label}\n"
-            f"📌 Статус: <b>В БАЗЕ СКАМЕРОВ</b>\n\n"
-            f"Будьте осторожны в общении с этим человеком!",
-            parse_mode="HTML"
-        )
-    else:
-        await message.answer(
-            f"✅ <b>РЕЗУЛЬТАТ ПОИСКА</b> ✅\n\n"
-            f"👤 Username: @{username}\n"
-            f"📌 Статус: <b>НЕ НАЙДЕН В БАЗЕ</b>\n\n"
-            f"Человек не числится в ScamBase.",
-            parse_mode="HTML"
-        )
-    
-    await state.clear()
-
-
-@dp.callback_query(F.data == "stats")
-async def show_stats(callback: CallbackQuery):
-    """Показать статистику"""
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    
-    cur.execute('SELECT COUNT(*) FROM scambase')
-    total_scammers = cur.fetchone()[0]
-    
-    cur.execute('SELECT label, COUNT(*) FROM scambase GROUP BY label')
-    labels_stats = cur.fetchall()
-    
-    cur.execute('SELECT COUNT(*) FROM reports WHERE status = "pending"')
-    pending_reports = cur.fetchone()[0]
-    
-    conn.close()
-    
-    stats_text = f"📊 <b>Статистика ScamBase</b> 📊\n\n"
-    stats_text += f"👥 Всего в базе: <b>{total_scammers}</b>\n"
-    stats_text += f"📋 Ожидающих заявок: <b>{pending_reports}</b>\n\n"
-    stats_text += "<b>По меткам:</b>\n"
-    
-    for label, count in labels_stats:
-        emoji = "🔴" if label == "Scammer" else "🟡" if label == "Face" else "🟢"
-        stats_text += f"{emoji} {label}: {count}\n"
-    
-    await callback.message.answer(stats_text, parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "delete_self")
-async def delete_self_prompt(callback: CallbackQuery):
-    """Запрос на удаление себя из базы за звёзды"""
-    user_label = is_in_scambase(f"user_{callback.from_user.id}")
-    
-    if not user_label:
-        await callback.message.answer("✅ Вы не найдены в базе ScamBase. Удаление не требуется.")
-        await callback.answer()
+    today = date.today().isoformat()
+    if user["last_daily"] == today:
+        await message.answer("❌ Ты уже получал бонус сегодня! Приходи завтра.")
         return
+    
+    user["balance"] += 500
+    user["last_daily"] = today
+    save_user(user_id)
+    
+    await message.answer(f"✅ Ежедневный бонус +500 монет!\n💰 Твой баланс: {user['balance']}")
+
+# Баланс
+@dp.message(Command("balance"))
+async def show_balance(message: Message):
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    await message.answer(f"💰 Твой баланс: {user['balance']} монет")
+
+# ========== ИГРА 1: КУБИК-ДУЭЛЬ (создание ставки) ==========
+# Хранилище активных дуэлей: {creator_id: {"bet": amount, "challenger": None}}
+active_duels = {}
+
+@dp.message(Command("dice_battle"))
+async def cmd_dice_battle(message: Message, command: CommandObject):
+    if not message.chat.type in ["group", "supergroup"]:
+        await message.answer("❌ Эта игра доступна ТОЛЬКО в беседах!")
+        return
+    
+    args = command.args
+    if not args or not args.isdigit():
+        await message.answer("❌ Использование: /dice_battle [сумма ставки]")
+        return
+    
+    bet = int(args)
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    
+    if bet <= 0:
+        await message.answer("❌ Ставка должна быть положительной!")
+        return
+    if user["balance"] < bet:
+        await message.answer(f"❌ Не хватает монет! Нужно {bet}, у тебя {user['balance']}")
+        return
+    
+    # Создаём дуэль
+    active_duels[user_id] = {"bet": bet, "creator_id": user_id, "challenger": None}
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"⭐ Удалить за {STAR_PRICE} звёзд", callback_data="confirm_star_delete")],
-        [InlineKeyboardButton(text="🔙 Отмена", callback_data="back_to_menu")]
+        [InlineKeyboardButton(text="⚔️ Принять бой!", callback_data=f"accept_duel_{user_id}")]
     ])
     
-    await callback.message.answer(
-        f"⚠️ <b>Вы находитесь в ScamBase!</b> ⚠️\n\n"
-        f"Ваша метка: {user_label}\n\n"
-        f"Вы можете удалить себя из базы за <b>{STAR_PRICE} ⭐</b>\n\n"
-        f"Нажмите на кнопку ниже, чтобы оплатить звёздами Telegram.",
-        parse_mode="HTML",
+    await message.answer(
+        f"🎲 {message.from_user.first_name} создал дуэль на кубиках!\n"
+        f"💰 Ставка: {bet} монет\n"
+        f"⚔️ Кто примет вызов? Нажми на кнопку!",
         reply_markup=keyboard
     )
-    await callback.answer()
 
-
-@dp.callback_query(F.data == "confirm_star_delete")
-async def process_star_delete(callback: CallbackQuery):
-    """Обработка удаления за звёзды"""
-    user_id = callback.from_user.id
-    username = f"user_{user_id}"
+@dp.callback_query(F.data.startswith("accept_duel_"))
+async def accept_duel(callback: CallbackQuery):
+    creator_id = int(callback.data.split("_")[2])
+    challenger_id = callback.from_user.id
     
-    try:
-        # Создаём инвойс для оплаты звёздами
-        await bot.send_invoice(
-            chat_id=user_id,
-            title="Удаление из ScamBase",
-            description=f"Удаление вашего профиля из базы ScamBase",
-            payload=f"delete_{user_id}",
-            currency="XTR",  # Telegram Stars
-            prices=[types.LabeledPrice(label="Удаление", amount=STAR_PRICE)],
-            need_name=False,
-            need_phone_number=False,
-            need_email=False
+    if challenger_id == creator_id:
+        await callback.answer("❌ Нельзя играть с самим собой!", show_alert=True)
+        return
+    
+    duel = active_duels.get(creator_id)
+    if not duel:
+        await callback.answer("❌ Дуэль уже завершена или отменена!", show_alert=True)
+        return
+    
+    if duel["challenger"] is not None:
+        await callback.answer("❌ На эту дуэль уже кто-то согласился!", show_alert=True)
+        return
+    
+    creator = get_user(creator_id)
+    challenger = get_user(challenger_id)
+    bet = duel["bet"]
+    
+    if challenger["balance"] < bet:
+        await callback.answer(f"❌ Не хватает {bet} монет для участия!", show_alert=True)
+        return
+    
+    # Блокируем ставки
+    creator["balance"] -= bet
+    challenger["balance"] -= bet
+    save_user(creator_id)
+    save_user(challenger_id)
+    duel["challenger"] = challenger_id
+    
+    await callback.message.edit_text(
+        f"⚔️ Бой начинается!\n"
+        f"{callback.from_user.first_name} принял вызов {callback.message.from_user.first_name}\n"
+        f"💰 Ставка: {bet} монет\n\n"
+        f"🎲 Бросаем кубики..."
+    )
+    
+    # Проводим дуэль
+    winner_id, val1, val2 = await dice_duel(callback.message, bet, creator_id, challenger_id)
+    
+    if winner_id is None:
+        await callback.message.answer(
+            f"🤝 НИЧЬЯ! Оба выбросили {val1}\n"
+            f"Ставки возвращаются игрокам."
         )
-        await callback.answer("💫 Отправлен счёт на оплату звёздами!")
-    except Exception as e:
-        await callback.message.answer(f"❌ Ошибка: {str(e)}\nПопробуйте позже.")
-        await callback.answer()
-
-
-@dp.pre_checkout_query()
-async def pre_checkout_query(pre_checkout: types.PreCheckoutQuery):
-    """Проверка перед оплатой"""
-    await pre_checkout.answer(ok=True)
-
-
-@dp.message(F.successful_payment)
-async def successful_payment(message: Message):
-    """Успешная оплата - удаляем пользователя"""
-    user_id = message.from_user.id
-    username = f"user_{user_id}"
+        creator["balance"] += bet
+        challenger["balance"] += bet
+        save_user(creator_id)
+        save_user(challenger_id)
+    else:
+        winner = get_user(winner_id)
+        winner["balance"] += bet * 2
+        winner["wins"] += 1
+        loser_id = creator_id if winner_id == challenger_id else challenger_id
+        loser = get_user(loser_id)
+        loser["losses"] += 1
+        save_user(winner_id)
+        save_user(loser_id)
+        
+        winner_name = (await bot.get_chat(winner_id)).first_name if winner_id != callback.from_user.id else callback.from_user.first_name
+        
+        await callback.message.answer(
+            f"🏆 ПОБЕДИТЕЛЬ: {winner_name}!\n"
+            f"🎲 {val1} vs {val2}\n"
+            f"💰 Выигрыш: {bet*2} монет!"
+        )
     
-    if remove_from_scambase(username):
+    # Удаляем дуэль
+    del active_duels[creator_id]
+
+# ========== ИГРА 2: ЧЁТ / НЕЧЁТ ==========
+@dp.message(Command("evenodd"))
+async def cmd_evenodd(message: Message, command: CommandObject):
+    if not message.chat.type in ["group", "supergroup"]:
+        await message.answer("❌ Эта игра доступна ТОЛЬКО в беседах!")
+        return
+    
+    args = command.args
+    if not args:
+        await message.answer("❌ Использование: /evenodd [сумма] [чёт/нечёт]\nПример: /evenodd 100 чёт")
+        return
+    
+    parts = args.split()
+    if len(parts) != 2 or not parts[0].isdigit() or parts[1] not in ["чёт", "нечет", "чет", "нечет"]:
+        await message.answer("❌ Неверный формат! Пример: /evenodd 100 чёт")
+        return
+    
+    bet = int(parts[0])
+    choice_normalized = "чёт" if parts[1].startswith("ч") else "нечёт"
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    
+    if user["balance"] < bet:
+        await message.answer(f"❌ Не хватает монет! Нужно {bet}, у тебя {user['balance']}")
+        return
+    
+    user["balance"] -= bet
+    save_user(user_id)
+    
+    # Анимированный кубик
+    dice_msg = await message.answer_dice(emoji="🎲")
+    value = dice_msg.dice.value
+    is_even = (value % 2 == 0)
+    result = "чёт" if is_even else "нечёт"
+    
+    if choice_normalized == result:
+        win_amount = bet * 2
+        user["balance"] += win_amount
+        user["wins"] += 1
+        save_user(user_id)
         await message.answer(
-            "✅ <b>Оплата получена! Вы удалены из ScamBase.</b> ✅\n\n"
-            "Ваше имя больше не числится в базе скамеров.\n"
-            "Спасибо за оплату звёздами! 🌟",
-            parse_mode="HTML",
-            reply_markup=main_menu_keyboard()
+            f"🎲 Выпало: {value} - {result.upper()}!\n"
+            f"✅ Ты угадал! +{win_amount} монет\n"
+            f"💰 Новый баланс: {user['balance']}"
         )
     else:
+        user["losses"] += 1
+        save_user(user_id)
         await message.answer(
-            "❌ Ошибка: вас не было в базе данных.\n"
-            "Возможно, вы уже были удалены ранее.",
-            reply_markup=main_menu_keyboard()
+            f"🎲 Выпало: {value} - {result.upper()}!\n"
+            f"❌ Ты не угадал. Потеряно {bet} монет\n"
+            f"💰 Новый баланс: {user['balance']}"
         )
 
-
-# ================= ЗАЯВКИ НА СКАММЕРА =================
-@dp.callback_query(F.data == "report")
-async def report_start(callback: CallbackQuery, state: FSMContext):
-    """Начало подачи заявки"""
-    await callback.message.answer(
-        "📝 <b>Подача заявки на скамера</b>\n\n"
-        "Введите username человека, которого вы хотите добавить в базу (без @):",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-    await state.set_state(ReportStates.waiting_for_username)
-
-
-@dp.message(ReportStates.waiting_for_username)
-async def report_get_username(message: Message, state: FSMContext):
-    """Получение username для заявки"""
-    username = message.text.strip().replace('@', '')
+# ========== ИГРА 3: ФУТБОЛ (анимированный) ==========
+@dp.message(Command("football"))
+async def cmd_football(message: Message, command: CommandObject):
+    if not message.chat.type in ["group", "supergroup"]:
+        await message.answer("❌ Эта игра доступна ТОЛЬКО в беседах!")
+        return
     
-    # Проверяем, нет ли уже в базе
-    if is_in_scambase(username):
+    args = command.args
+    if not args or not args.isdigit():
+        await message.answer("❌ Использование: /football [сумма ставки]")
+        return
+    
+    bet = int(args)
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    
+    if user["balance"] < bet:
+        await message.answer(f"❌ Не хватает монет! Нужно {bet}, у тебя {user['balance']}")
+        return
+    
+    user["balance"] -= bet
+    save_user(user_id)
+    
+    # Анимированный футбольный мяч (⚽)
+    await message.answer("⚽ Матч начинается...")
+    await asyncio.sleep(0.5)
+    
+    # В Telegram есть специальный эмодзи для футбола - это dice с эмодзи ⚽
+    # Но dice с ⚽ даёт случайный результат 1-5 (голы)
+    football_msg = await message.answer_dice(emoji="⚽")
+    goals = football_msg.dice.value  # от 1 до 5
+    
+    if goals >= 4:
+        # Победа (ставка умножается на коэффициент ~2.5)
+        win_amount = int(bet * 2.5)
+        user["balance"] += win_amount
+        user["wins"] += 1
+        save_user(user_id)
         await message.answer(
-            "⚠️ Этот человек уже находится в ScamBase!\n\n"
-            "Вы можете проверить его через поиск.",
-            reply_markup=main_menu_keyboard()
+            f"🏆 ГОЛ! Твоя команда забила {goals} гола!\n"
+            f"✅ Ты выиграл {win_amount} монет!\n"
+            f"💰 Новый баланс: {user['balance']}"
         )
-        await state.clear()
-        return
-    
-    await state.update_data(report_username=username)
-    await message.answer(
-        "📸 Теперь отправьте <b>фото-доказательства</b> (можно несколько фото в одном сообщении)\n\n"
-        "Отправьте 'готово', если фото нет:",
-        parse_mode="HTML"
-    )
-    await state.set_state(ReportStates.waiting_for_proof_photos)
+    else:
+        user["losses"] += 1
+        save_user(user_id)
+        await message.answer(
+            f"😭 Твоя команда проиграла со счётом {goals}-{random.randint(goals+1, 5)}\n"
+            f"❌ Потеряно {bet} монет\n"
+            f"💰 Новый баланс: {user['balance']}"
+        )
 
-
-@dp.message(ReportStates.waiting_for_proof_photos)
-async def report_get_photos(message: Message, state: FSMContext):
-    """Получение фото доказательств"""
-    photos = []
-    
-    if message.photo:
-        photos = [message.photo[-1].file_id]
-    elif message.text and message.text.lower() == 'готово':
-        pass
-    elif message.text:
-        await message.answer("Пожалуйста, отправьте фото или напишите 'готово'")
-        return
-    
-    await state.update_data(report_photos=photos)
-    
-    await message.answer(
-        "🎥 Теперь отправьте <b>видео-доказательства</b> (можно несколько видео)\n\n"
-        "Отправьте 'готово', если видео нет:",
-        parse_mode="HTML"
-    )
-    await state.set_state(ReportStates.waiting_for_proof_videos)
-
-
-@dp.message(ReportStates.waiting_for_proof_videos)
-async def report_get_videos(message: Message, state: FSMContext):
-    """Получение видео доказательств"""
-    videos = []
-    
-    if message.video:
-        videos = [message.video.file_id]
-    elif message.text and message.text.lower() == 'готово':
-        pass
-    elif message.text:
-        await message.answer("Пожалуйста, отправьте видео или напишите 'готово'")
-        return
-    
-    data = await state.get_data()
-    username = data.get('report_username')
-    photos = data.get('report_photos', [])
-    
-    # Сохраняем заявку
-    add_report(username, message.from_user.id, photos, videos)
-    
-    # Уведомляем админов
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"📋 <b>НОВАЯ ЗАЯВКА В SCAMBASE!</b>\n\n"
-                f"👤 Пользователь: @{username}\n"
-                f"📝 Подал: {message.from_user.full_name} (ID: {message.from_user.id})\n"
-                f"📸 Фото: {len(photos)} шт.\n"
-                f"🎥 Видео: {len(videos)} шт.\n\n"
-                f"Используйте админ-панель для рассмотрения заявки.",
-                parse_mode="HTML"
-            )
-        except:
-            pass
-    
-    await message.answer(
-        "✅ <b>Заявка успешно отправлена!</b> ✅\n\n"
-        f"👤 Человек: @{username}\n"
-        f"📸 Доказательств: {len(photos)} фото, {len(videos)} видео\n\n"
-        "Администраторы рассмотрят вашу заявку в ближайшее время.\n"
-        "Спасибо за помощь в борьбе со скамерами! 🙏",
-        parse_mode="HTML",
-        reply_markup=main_menu_keyboard()
-    )
-    
-    await state.clear()
-
-
-# ================= АДМИН-ПАНЕЛЬ =================
-def is_admin(user_id: int) -> bool:
-    """Проверка, является ли пользователь админом"""
+# ========== АДМИН-КОМАНДЫ ==========
+def is_admin(user_id):
     return user_id in ADMIN_IDS
 
-
-@dp.callback_query(F.data == "admin_panel")
-async def admin_panel(callback: CallbackQuery):
-    """Панель администратора"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён! Вы не администратор.", show_alert=True)
+# Информация о беседе
+@dp.message(Command("chat_info"))
+async def chat_info(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только для администратора бота!")
         return
     
-    await callback.message.answer(
-        "👑 <b>Панель администратора ScamBase</b> 👑\n\n"
-        "Выберите действие:",
-        parse_mode="HTML",
-        reply_markup=admin_panel_keyboard()
+    chat = message.chat
+    info = (
+        f"📊 Информация о беседе:\n"
+        f"🆔 ID: {chat.id}\n"
+        f"📛 Название: {chat.title}\n"
+        f"👥 Тип: {chat.type}\n"
+        f"👤 Участников: {await bot.get_chat_member_count(chat.id)}"
     )
-    await callback.answer()
+    await message.answer(info)
 
-
-@dp.callback_query(F.data == "admin_add")
-async def admin_add_prompt(callback: CallbackQuery, state: FSMContext):
-    """Запрос username для добавления"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+# Выдать валюту (можно в ЛС и беседе)
+@dp.message(Command("give"))
+async def give_money(message: Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только для администратора бота!")
         return
     
-    await callback.message.answer("➕ Введите username для добавления в базу (без @):")
-    await callback.answer()
-    await state.set_state(AdminAddStates.waiting_for_username)
-
-
-@dp.message(AdminAddStates.waiting_for_username)
-async def admin_add_get_username(message: Message, state: FSMContext):
-    """Получение username и запрос метки"""
-    username = message.text.strip().replace('@', '')
-    
-    if is_in_scambase(username):
-        await message.answer("⚠️ Этот пользователь уже есть в базе!")
-        await state.clear()
+    args = command.args
+    if not args:
+        await message.answer("❌ Использование: /give [user_id] [сумма]")
         return
     
-    await state.update_data(add_username=username)
+    parts = args.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("❌ Неверный формат! Пример: /give 123456789 1000")
+        return
+    
+    target_id = int(parts[0])
+    amount = int(parts[1])
+    
+    user = get_user(target_id)
+    user["balance"] += amount
+    save_user(target_id)
+    
+    await message.answer(f"✅ Выдано {amount} монет пользователю ID {target_id}")
+
+# Пинг бота
+@dp.message(Command("ping"))
+async def ping_bot(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только для администратора бота!")
+        return
+    await message.answer("🏓 Понг! Бот работает.")
+
+# Статистика бота
+@dp.message(Command("stats"))
+async def bot_stats(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только для администратора бота!")
+        return
+    
+    total_users = len(user_cache)
+    total_balance = sum(u["balance"] for u in user_cache.values())
+    total_wins = sum(u["wins"] for u in user_cache.values())
+    
     await message.answer(
-        "🏷️ Выберите метку для пользователя:",
-        reply_markup=label_keyboard(username)
+        f"📈 Статистика бота:\n"
+        f"👥 Пользователей: {total_users}\n"
+        f"💰 Общий баланс: {total_balance}\n"
+        f"🏆 Всего побед: {total_wins}"
     )
-    await state.clear()  # Очищаем, так как дальше callback
 
-
-@dp.callback_query(F.data.startswith("label_"))
-async def admin_set_label(callback: CallbackQuery):
-    """Установка метки при добавлении"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+# Статистика пользователя
+@dp.message(Command("user_stats"))
+async def user_stats(message: Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только для администратора бота!")
         return
     
-    _, username, label = callback.data.split("_")
-    
-    if add_to_scambase(username, label, callback.from_user.id):
-        await callback.message.answer(
-            f"✅ Пользователь @{username} добавлен в ScamBase с меткой {label}!"
-        )
-    else:
-        await callback.message.answer(f"❌ Ошибка: пользователь @{username} уже существует или ошибка БД.")
-    
-    await callback.answer()
-    await callback.message.answer("👑 Админ-панель:", reply_markup=admin_panel_keyboard())
-
-
-@dp.callback_query(F.data == "admin_remove")
-async def admin_remove_prompt(callback: CallbackQuery, state: FSMContext):
-    """Запрос username для удаления"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+    args = command.args
+    if not args or not args.isdigit():
+        await message.answer("❌ Использование: /user_stats [user_id]")
         return
     
-    await callback.message.answer("❌ Введите username для удаления из базы (без @):")
-    await callback.answer()
-    await state.set_state(AdminRemoveStates.waiting_for_username)
-
-
-@dp.message(AdminRemoveStates.waiting_for_username)
-async def admin_remove_user(message: Message, state: FSMContext):
-    """Удаление пользователя админом"""
-    username = message.text.strip().replace('@', '')
+    user_id = int(args)
+    user = get_user(user_id)
     
-    if remove_from_scambase(username):
-        await message.answer(f"✅ Пользователь @{username} удалён из ScamBase!")
-    else:
-        await message.answer(f"❌ Пользователь @{username} не найден в базе.")
+    try:
+        tg_user = await bot.get_chat(user_id)
+        name = tg_user.first_name
+    except:
+        name = f"ID{user_id}"
     
-    await state.clear()
-    await message.answer("👑 Админ-панель:", reply_markup=admin_panel_keyboard())
-
-
-@dp.callback_query(F.data == "admin_label")
-async def admin_label_prompt(callback: CallbackQuery, state: FSMContext):
-    """Запрос username для выдачи метки"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    await callback.message.answer("🏷️ Введите username для изменения метки (без @):")
-    await callback.answer()
-    await state.set_state("waiting_label_username")
-
-
-@dp.message(StateFilter("waiting_label_username"))
-async def admin_label_get_username(message: Message, state: FSMContext):
-    """Получение username для смены метки"""
-    username = message.text.strip().replace('@', '')
-    
-    if not is_in_scambase(username):
-        await message.answer("❌ Пользователь не найден в базе!")
-        await state.clear()
-        return
-    
-    await state.update_data(label_username=username)
     await message.answer(
-        f"🏷️ Выберите новую метку для @{username}:",
-        reply_markup=label_keyboard(username)
+        f"📊 Статистика игрока {name}:\n"
+        f"💰 Баланс: {user['balance']}\n"
+        f"🏆 Побед: {user['wins']}\n"
+        f"💀 Поражений: {user['losses']}"
     )
-    await state.clear()
 
-
-@dp.callback_query(F.data.startswith("change_label_"))
-async def admin_change_label(callback: CallbackQuery):
-    """Изменение метки у существующего пользователя"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    _, username, new_label = callback.data.split("_")
-    
-    if update_label(username, new_label):
-        await callback.message.answer(f"✅ Метка для @{username} изменена на {new_label}!")
-    else:
-        await callback.message.answer(f"❌ Ошибка: пользователь @{username} не найден.")
-    
-    await callback.answer()
-    await callback.message.answer("👑 Админ-панель:", reply_markup=admin_panel_keyboard())
-
-
-@dp.callback_query(F.data == "admin_reports")
-async def admin_show_reports(callback: CallbackQuery):
-    """Показать все заявки"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    reports = get_pending_reports()
-    
-    if not reports:
-        await callback.message.answer("📭 Нет ожидающих заявок.")
-        await callback.answer()
-        return
-    
-    for report in reports:
-        report_id, username, reported_by, photos, videos, date = report
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Одобрить (Scammer)", callback_data=f"approve_{report_id}_{username}_Scammer"),
-                InlineKeyboardButton(text="✅ Одобрить (Face)", callback_data=f"approve_{report_id}_{username}_Face"),
-                InlineKeyboardButton(text="✅ Одобрить (Worker)", callback_data=f"approve_{report_id}_{username}_Worker")
-            ],
-            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{report_id}")]
-        ])
-        
-        text = f"📋 <b>Заявка #{report_id}</b>\n"
-        text += f"👤 Username: @{username}\n"
-        text += f"👮 Подал: ID {reported_by}\n"
-        text += f"📅 Дата: {date[:19]}\n"
-        text += f"📸 Фото: {len(photos.split(',')) if photos else 0}\n"
-        text += f"🎥 Видео: {len(videos.split(',')) if videos else 0}\n"
-        
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
-    
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("approve_"))
-async def admin_approve_report(callback: CallbackQuery):
-    """Одобрение заявки"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    _, report_id, username, label = callback.data.split("_")
-    report_id = int(report_id)
-    
-    approve_report(report_id, username, label, callback.from_user.id)
-    
-    await callback.message.answer(f"✅ Заявка #{report_id} одобрена! @{username} добавлен в базу с меткой {label}.")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("reject_"))
-async def admin_reject_report(callback: CallbackQuery):
-    """Отклонение заявки"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    report_id = int(callback.data.split("_")[1])
-    reject_report(report_id)
-    
-    await callback.message.answer(f"❌ Заявка #{report_id} отклонена.")
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "back_to_menu")
-async def back_to_menu(callback: CallbackQuery):
-    """Возврат в главное меню"""
-    await callback.message.answer("Главное меню:", reply_markup=main_menu_keyboard())
-    await callback.answer()
-
-
-# ================= ЗАПУСК БОТА =================
+# ========== ЗАПУСК БОТА ==========
 async def main():
-    """Запуск бота"""
-    init_db()
-    print("✅ Бот ScamBase запущен!")
+    print("🤖 Бот запущен!")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
