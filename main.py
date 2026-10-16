@@ -13,7 +13,7 @@ from aiogram.utils.markdown import hbold, hcode
 from aiogram.types.input_file import FSInputFile
 
 # ========== КОНФИГУРАЦИЯ ==========
-BOT_TOKEN = "8854156297:AAH_Gr1faNeHDznR4D9KzjzupWsqY64-6IA"  # Замени на свой токен!
+BOT_TOKEN = "8574767944:AAFbyzaPW7T7e5ieFkKdPcVOAYGe124ovKE"  # Замени на свой токен!
 ADMIN_IDS = [7673683792]  # Сюда вставь свой Telegram ID (целое число)
 
 # Файл для хранения данных пользователей
